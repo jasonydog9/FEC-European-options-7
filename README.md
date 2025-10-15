@@ -1,7 +1,7 @@
 # Machine Learning for European Option Pricing (Team Name: FEC-European-options-7)
 
 ## 📘 Overview
-This project explores the use of **machine learning models** to price **European-style options** and estimate **implied volatility** using open-source data from [OptionDX.com](https://optiondx.com/).  
+This project explores the use of **machine learning models** to price **European-style options** and estimate **implied volatility** using open-source data from [OptionsDX.com](https://optionsdx.com/).  
 The goal is to assess whether machine learning methods can match or outperform traditional numerical approaches (like Black-Scholes) in terms of both accuracy and computational efficiency.
 
 ---
