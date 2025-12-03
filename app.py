@@ -347,11 +347,36 @@ def main():
             with col_b:
                 fig = px.bar(comparison_df, x='Model', y='Calculation Time (ms)', title='Speed Comparison', color='Model')
                 st.plotly_chart(fig, width='stretch')
-
+    
     # Info & disclaimers
     st.markdown("---")
     st.markdown("### ℹ️ About This Tool")
     st.info("Models are trained using CSVs in `data/model_input/`. Expected columns include: STRIKE, moneyness, T_years, iv, risk_free_rate. The app will derive underlying_price = moneyness * STRIKE.")
+    with st.expander("How It Works"):
+        st.markdown("""
+        This application uses machine learning models trained on historical SPX options data to predict implied volatility:
+
+        - **Random Forest**: Ensemble of decision trees, excellent for feature importance analysis
+        - **XGBoost**: Gradient boosting algorithm, optimized for speed and accuracy
+        - **Neural Networks**: Deep learning approach for capturing complex patterns (available in notebooks)
+
+        The models are trained on features including:
+        - Time to expiration (years)
+        - Moneyness (S/K ratio)
+        - Risk-free rate
+        """)
+
+    with st.expander("Model Training"):
+        st.markdown("""
+        Models are trained on SPX European options data with the following characteristics:
+
+        - **Dataset**: ~2.8M option contracts from 2022
+        - **Train/Val/Test Split**: 70/15/15 (random split)
+        - **Performance**: R² ≈ 0.40-0.45 on test set
+        - **Speed**: 100-1000x faster than numerical Black-Scholes solver
+
+        See the Jupyter notebooks in the `Notebooks/` directory for full training details.
+        """)
     with st.expander("Limitations & Disclaimers"):
         st.markdown("""
         ⚠️ For educational/research use only. Not financial advice.
@@ -361,3 +386,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
