@@ -17,6 +17,9 @@ import time
 import joblib
 from pathlib import Path
 from sklearn.metrics import r2_score, mean_squared_error
+import requests
+from pathlib import Path
+from io import BytesIO
 
 # -------------------
 # Page config / CSS
@@ -101,156 +104,27 @@ TARGET_COL = "iv"  # as in your CSVs
 @st.cache_resource
 def load_or_train_models():
     """
-    Loads models and scaler if saved; otherwise trains on CSVs in data/model_input.
+    Loads pre-trained models and scaler directly from GitHub releases into memory.
     Returns (rf_model, xgb_model, scaler).
     """
 
-    # Try loading saved models
-    if RF_PATH.exists() and XGB_PATH.exists() and SCALER_PATH.exists():
-        try:
-            rf_model = joblib.load(RF_PATH)
-            xgb_model = joblib.load(XGB_PATH)
-            scaler = joblib.load(SCALER_PATH)
-            st.success("📦 Loaded pre-trained models & scaler from disk.")
-            return rf_model, xgb_model, scaler
-        except Exception as e:
-            st.warning(f"Failed loading saved models: {e}. Re-training...")
+    # URLs for GitHub release assets
+    RF_URL = "https://github.com/jasonydog9/FEC-European-options-7/releases/download/models/rf_model.pkl"
+    XGB_URL = "https://github.com/jasonydog9/FEC-European-options-7/releases/download/models/xgb_model.pkl"
+    SCALER_URL = "https://github.com/jasonydog9/FEC-European-options-7/releases/download/models/scaler.pkl"
 
-    # -----------------------------------------------------------
-    # 1) Locate CSV files in data/model_input
-    # -----------------------------------------------------------
-    csv_files = list((DATA_DIR / "model_input").glob("*.csv"))
+    def load_from_url(url):
+        st.info(f"⬇️ Loading {url.split('/')[-1]} from GitHub...")
+        r = requests.get(url)
+        r.raise_for_status()
+        return joblib.load(BytesIO(r.content))
 
-    if len(csv_files) == 0:
-        st.warning("No CSV files found under data/model_input. Falling back to synthetic demo models.")
-        return _train_demo_models()
+    # Load models and scaler directly into memory
+    rf_model = load_from_url(RF_URL)
+    xgb_model = load_from_url(XGB_URL)
+    scaler = load_from_url(SCALER_URL)
 
-    # -----------------------------------------------------------
-    # 2) Load all CSVs
-    # -----------------------------------------------------------
-    df_list = []
-    for f in csv_files:
-        try:
-            df = pd.read_csv(f)
-            df_list.append(df)
-        except Exception as e:
-            st.error(f"Failed to load {f.name}: {e}")
-
-    if len(df_list) == 0:
-        st.error("No valid CSVs loaded. Falling back to demo models.")
-        return _train_demo_models()
-
-    data = pd.concat(df_list, ignore_index=True)
-    st.info(f"📄 Loaded {len(csv_files)} files, {len(data):,} rows")
-    st.write("Preview columns:", data.columns.tolist())
-
-    # -----------------------------------------------------------
-    # 3) Validate required columns
-    # -----------------------------------------------------------
-    # Your CSV schema:
-    # ['QUOTE_DATE', 'EXPIRE_DATE', 'STRIKE', 'option_type', 'iv',
-    #  'iv_normalized', 'T_years', 'moneyness', 'risk_free_rate']
-
-    required = {"STRIKE", "moneyness", "T_years", "iv", "risk_free_rate"}
-    missing = [c for c in required if c not in data.columns]
-
-    if len(missing) > 0:
-        st.error(f"❌ Required columns missing from your CSVs: {missing}")
-        st.stop()
-
-    # -----------------------------------------------------------
-    # 4) Clean + cast numeric
-    # -----------------------------------------------------------
-    num_cols = ["STRIKE", "moneyness", "T_years", "iv", "risk_free_rate"]
-    for col in num_cols:
-        data[col] = pd.to_numeric(data[col], errors="coerce")
-
-    before = len(data)
-    data = data.dropna(subset=num_cols)
-    st.write(f"🧹 Dropped {before - len(data):,} rows with NaNs")
-
-    # Filter out blatantly invalid rows
-    data = data[(data["iv"] > 0) & (data["iv"] < 5)]
-    data = data[data["T_years"] > 0]
-
-    # -----------------------------------------------------------
-    # 5) Derive underlying_price (S)
-    # -----------------------------------------------------------
-    data["underlying_price"] = data["moneyness"] * data["STRIKE"]
-
-    # -----------------------------------------------------------
-    # 6) Select features + target
-    # -----------------------------------------------------------
-    # Automatically detect feature columns
-    FEATURE_COLS = ["T_years", "moneyness", "risk_free_rate", "underlying_price", "STRIKE"]
-
-    missing_features = [c for c in FEATURE_COLS if c not in data.columns]
-    if missing_features:
-        st.error(f"❌ Missing features: {missing_features}")
-        st.stop()
-
-    X = data[FEATURE_COLS].copy()
-    y = data["iv"].copy()
-
-    st.info(f"📊 Training dataset: {len(X):,} rows, {len(FEATURE_COLS)} features")
-
-    # -----------------------------------------------------------
-    # 7) Scale inputs
-    # -----------------------------------------------------------
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
-    # -----------------------------------------------------------
-    # 8) Train models
-    # -----------------------------------------------------------
-    rf_model = RandomForestRegressor(
-        n_estimators=200,
-        max_depth=25,
-        min_samples_split=10,
-        min_samples_leaf=5,
-        n_jobs=-1,
-        random_state=42
-    )
-
-    xgb_model = xgb.XGBRegressor(
-        n_estimators=300,
-        max_depth=10,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_lambda=1.0,
-        n_jobs=-1,
-        random_state=42,
-        verbosity=0
-    )
-
-    with st.spinner("🌲 Training Random Forest..."):
-        rf_model.fit(X_scaled, y)
-
-    with st.spinner("🚀 Training XGBoost..."):
-        xgb_model.fit(X_scaled, y, verbose=False)
-
-    # -----------------------------------------------------------
-    # 9) Evaluate (train-set quick check)
-    # -----------------------------------------------------------
-    preds_rf = rf_model.predict(X_scaled)
-    preds_xgb = xgb_model.predict(X_scaled)
-
-    st.success("🎯 Model Performance (train set)")
-
-    st.write(f"RandomForest — R²: {r2_score(y, preds_rf):.4f}, RMSE: {mean_squared_error(y, preds_rf, squared=False):.6f}")
-    st.write(f"XGBoost      — R²: {r2_score(y, preds_xgb):.4f}, RMSE: {mean_squared_error(y, preds_xgb, squared=False):.6f}")
-
-    # -----------------------------------------------------------
-    # 10) Save models + scaler
-    # -----------------------------------------------------------
-    try:
-        joblib.dump(rf_model, RF_PATH)
-        joblib.dump(xgb_model, XGB_PATH)
-        joblib.dump(scaler, SCALER_PATH)
-        st.info(f"💾 Saved models and scaler to {MODELS_DIR}")
-    except Exception as e:
-        st.warning(f"⚠️ Could not save models: {e}")
+    st.success("🎯 All models loaded from GitHub into memory!")
 
     return rf_model, xgb_model, scaler
 
