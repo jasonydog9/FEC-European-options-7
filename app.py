@@ -372,7 +372,7 @@ def main():
 
         - **Dataset**: ~2.8M option contracts from 2022
         - **Train/Val/Test Split**: 70/15/15 (random split)
-        - **Performance**: R² ≈ 0.40-0.45 on test set
+        - **Performance**: R² ≈ 0.8 on test set
         - **Speed**: 100-1000x faster than numerical Black-Scholes solver
 
         See the Jupyter notebooks in the `Notebooks/` directory for full training details.
@@ -386,4 +386,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
