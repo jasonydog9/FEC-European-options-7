@@ -1,6 +1,7 @@
 """
 European Options Implied Volatility Calculator
-Machine Learning-based IV prediction using Random Forest, XGBoost, and Neural Networks
+Machine Learning-based IV prediction using Random Forest and XGBoost
+Trains on CSVs found in data/model_input/*.csv (expects columns like STRIKE, moneyness, T_years, iv, risk_free_rate)
 """
 
 import streamlit as st
@@ -11,15 +12,15 @@ import plotly.express as px
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 import xgboost as xgb
-from sklearn.neural_network import MLPRegressor
 from scipy.stats import norm
 import time
-import pickle
-import os
 import joblib
 from pathlib import Path
+from sklearn.metrics import r2_score, mean_squared_error
 
-# Page configuration
+# -------------------
+# Page config / CSS
+# -------------------
 st.set_page_config(
     page_title="European Options IV Calculator",
     page_icon="📈",
@@ -27,7 +28,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS
 st.markdown("""
     <style>
     .main {
@@ -39,149 +39,267 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-
-# Black-Scholes functions
+# -------------------
+# Black-Scholes utils
+# -------------------
 def black_scholes_call(S, K, T, r, sigma):
-    """Calculate Black-Scholes call option price."""
     if T <= 0 or sigma <= 0:
         return max(S - K, 0)
-
     d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
     d2 = d1 - sigma * np.sqrt(T)
-
     call_price = S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
     return call_price
 
-
 def black_scholes_put(S, K, T, r, sigma):
-    """Calculate Black-Scholes put option price."""
     if T <= 0 or sigma <= 0:
         return max(K - S, 0)
-
     d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
     d2 = d1 - sigma * np.sqrt(T)
-
     put_price = K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
     return put_price
 
-
 def vega(S, K, T, r, sigma):
-    """Calculate vega."""
     if T <= 0:
         return 0.0001
-
     d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
     vega_value = S * norm.pdf(d1) * np.sqrt(T)
-
     return max(vega_value, 0.0001)
 
-
 def implied_volatility_newton(option_price, S, K, T, r, option_type='call', max_iterations=100):
-    """Calculate implied volatility using Newton-Raphson method."""
-    sigma = 0.2  # Initial guess
-
-    for i in range(max_iterations):
-        if option_type == 'call':
-            price = black_scholes_call(S, K, T, r, sigma)
-        else:
-            price = black_scholes_put(S, K, T, r, sigma)
-
-        vega_val = vega(S, K, T, r, sigma)
+    sigma = 0.2
+    for _ in range(max_iterations):
+        price = black_scholes_call(S, K, T, r, sigma) if option_type == 'call' else black_scholes_put(S, K, T, r, sigma)
+        v = vega(S, K, T, r, sigma)
         diff = option_price - price
-
         if abs(diff) < 1e-6:
             return sigma
-
-        sigma = sigma + diff / vega_val
+        sigma = sigma + diff / v
         sigma = max(0.001, min(sigma, 5.0))
-
     return sigma
 
+# -------------------
+# Paths
+# -------------------
+try:
+    BASE_DIR = Path(__file__).resolve().parent
+except NameError:
+    BASE_DIR = Path.cwd()
+DATA_DIR = BASE_DIR / "data"
+MODELS_DIR = BASE_DIR / "models"
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-BASE_DIR = Path(os.getcwd())
-MODELS_DIR = BASE_DIR / 'models'
+RF_PATH = MODELS_DIR / "rf_model.pkl"
+XGB_PATH = MODELS_DIR / "xgb_model.pkl"
+SCALER_PATH = MODELS_DIR / "scaler.pkl"
 
+FEATURE_COLS = ["T_years", "moneyness", "risk_free_rate"]
+TARGET_COL = "iv"  # as in your CSVs
 
+# -------------------
+# Load / Train Models
+# -------------------
 @st.cache_resource
 def load_or_train_models():
-    """Load pre-trained models or create demo models."""
-    rf_path = MODELS_DIR / 'rf_model.pkl'
-    xgb_path = MODELS_DIR / 'xgb_model.pkl'
-    
-    
-    # Create and train demo models with realistic data
-    st.info("📚 Training demo models with synthetic data (matching notebook hyperparameters)...")
-    
-    # Use same hyperparameters as the training notebook
+    """
+    Loads models and scaler if saved; otherwise trains on CSVs in data/model_input.
+    Returns (rf_model, xgb_model, scaler).
+    """
+
+    # Try loading saved models
+    if RF_PATH.exists() and XGB_PATH.exists() and SCALER_PATH.exists():
+        try:
+            rf_model = joblib.load(RF_PATH)
+            xgb_model = joblib.load(XGB_PATH)
+            scaler = joblib.load(SCALER_PATH)
+            st.success("📦 Loaded pre-trained models & scaler from disk.")
+            return rf_model, xgb_model, scaler
+        except Exception as e:
+            st.warning(f"Failed loading saved models: {e}. Re-training...")
+
+    # -----------------------------------------------------------
+    # 1) Locate CSV files in data/model_input
+    # -----------------------------------------------------------
+    csv_files = list((DATA_DIR / "model_input").glob("*.csv"))
+
+    if len(csv_files) == 0:
+        st.warning("No CSV files found under data/model_input. Falling back to synthetic demo models.")
+        return _train_demo_models()
+
+    # -----------------------------------------------------------
+    # 2) Load all CSVs
+    # -----------------------------------------------------------
+    df_list = []
+    for f in csv_files:
+        try:
+            df = pd.read_csv(f)
+            df_list.append(df)
+        except Exception as e:
+            st.error(f"Failed to load {f.name}: {e}")
+
+    if len(df_list) == 0:
+        st.error("No valid CSVs loaded. Falling back to demo models.")
+        return _train_demo_models()
+
+    data = pd.concat(df_list, ignore_index=True)
+    st.info(f"📄 Loaded {len(csv_files)} files, {len(data):,} rows")
+    st.write("Preview columns:", data.columns.tolist())
+
+    # -----------------------------------------------------------
+    # 3) Validate required columns
+    # -----------------------------------------------------------
+    # Your CSV schema:
+    # ['QUOTE_DATE', 'EXPIRE_DATE', 'STRIKE', 'option_type', 'iv',
+    #  'iv_normalized', 'T_years', 'moneyness', 'risk_free_rate']
+
+    required = {"STRIKE", "moneyness", "T_years", "iv", "risk_free_rate"}
+    missing = [c for c in required if c not in data.columns]
+
+    if len(missing) > 0:
+        st.error(f"❌ Required columns missing from your CSVs: {missing}")
+        st.stop()
+
+    # -----------------------------------------------------------
+    # 4) Clean + cast numeric
+    # -----------------------------------------------------------
+    num_cols = ["STRIKE", "moneyness", "T_years", "iv", "risk_free_rate"]
+    for col in num_cols:
+        data[col] = pd.to_numeric(data[col], errors="coerce")
+
+    before = len(data)
+    data = data.dropna(subset=num_cols)
+    st.write(f"🧹 Dropped {before - len(data):,} rows with NaNs")
+
+    # Filter out blatantly invalid rows
+    data = data[(data["iv"] > 0) & (data["iv"] < 5)]
+    data = data[data["T_years"] > 0]
+
+    # -----------------------------------------------------------
+    # 5) Derive underlying_price (S)
+    # -----------------------------------------------------------
+    data["underlying_price"] = data["moneyness"] * data["STRIKE"]
+
+    # -----------------------------------------------------------
+    # 6) Select features + target
+    # -----------------------------------------------------------
+    # Automatically detect feature columns
+    FEATURE_COLS = ["T_years", "moneyness", "risk_free_rate", "underlying_price", "STRIKE"]
+
+    missing_features = [c for c in FEATURE_COLS if c not in data.columns]
+    if missing_features:
+        st.error(f"❌ Missing features: {missing_features}")
+        st.stop()
+
+    X = data[FEATURE_COLS].copy()
+    y = data["iv"].copy()
+
+    st.info(f"📊 Training dataset: {len(X):,} rows, {len(FEATURE_COLS)} features")
+
+    # -----------------------------------------------------------
+    # 7) Scale inputs
+    # -----------------------------------------------------------
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    # -----------------------------------------------------------
+    # 8) Train models
+    # -----------------------------------------------------------
     rf_model = RandomForestRegressor(
-        n_estimators=100,
-        max_depth=20,
+        n_estimators=200,
+        max_depth=25,
         min_samples_split=10,
         min_samples_leaf=5,
-        random_state=42,
         n_jobs=-1,
-        verbose=0  # Suppress parallel job output
+        random_state=42
     )
-    
+
     xgb_model = xgb.XGBRegressor(
-        n_estimators=100,
+        n_estimators=300,
         max_depth=10,
-        learning_rate=0.1,
+        learning_rate=0.05,
         subsample=0.8,
         colsample_bytree=0.8,
-        random_state=42,
+        reg_lambda=1.0,
         n_jobs=-1,
+        random_state=42,
         verbosity=0
     )
-    
-    # Generate realistic synthetic training data
+
+    with st.spinner("🌲 Training Random Forest..."):
+        rf_model.fit(X_scaled, y)
+
+    with st.spinner("🚀 Training XGBoost..."):
+        xgb_model.fit(X_scaled, y, verbose=False)
+
+    # -----------------------------------------------------------
+    # 9) Evaluate (train-set quick check)
+    # -----------------------------------------------------------
+    preds_rf = rf_model.predict(X_scaled)
+    preds_xgb = xgb_model.predict(X_scaled)
+
+    st.success("🎯 Model Performance (train set)")
+
+    st.write(f"RandomForest — R²: {r2_score(y, preds_rf):.4f}, RMSE: {mean_squared_error(y, preds_rf, squared=False):.6f}")
+    st.write(f"XGBoost      — R²: {r2_score(y, preds_xgb):.4f}, RMSE: {mean_squared_error(y, preds_xgb, squared=False):.6f}")
+
+    # -----------------------------------------------------------
+    # 10) Save models + scaler
+    # -----------------------------------------------------------
+    try:
+        joblib.dump(rf_model, RF_PATH)
+        joblib.dump(xgb_model, XGB_PATH)
+        joblib.dump(scaler, SCALER_PATH)
+        st.info(f"💾 Saved models and scaler to {MODELS_DIR}")
+    except Exception as e:
+        st.warning(f"⚠️ Could not save models: {e}")
+
+    return rf_model, xgb_model, scaler
+
+
+def _train_demo_models():
+    """Fallback synthetic demo training (keeps previous behavior)."""
     np.random.seed(42)
-    n_samples = 10000
-    
+    n_samples = 20000
     X_demo = pd.DataFrame({
         'T_years': np.random.uniform(0.01, 2, n_samples),
         'moneyness': np.random.uniform(0.7, 1.3, n_samples),
         'risk_free_rate': np.random.uniform(0.01, 0.05, n_samples)
     })
-    
-    # Realistic IV simulation with volatility smile pattern
-    # Base IV starts around 20%
     base_iv = 0.20
-    
-    # Add volatility smile (higher IV for OTM options)
     smile_effect = 0.15 * np.abs(X_demo['moneyness'] - 1)
-    
-    # Add term structure (higher IV for shorter-term options)
     term_effect = 0.05 / np.sqrt(X_demo['T_years'])
-    
-    # Add some random noise
     noise = np.random.normal(0, 0.02, n_samples)
-    
-    y_demo = base_iv + smile_effect + term_effect + noise
-    
-    # Clip to reasonable range (5% to 150%)
-    y_demo = np.clip(y_demo, 0.05, 1.5)
-    
-    # Train models
-    with st.spinner('Training Random Forest...'):
-        rf_model.fit(X_demo, y_demo)
-    
-    with st.spinner('Training XGBoost...'):
-        xgb_model.fit(X_demo, y_demo, verbose=False)
-    
-    st.success("✅ Demo models trained successfully!")
-    st.info("💡 For better accuracy, train models using the Jupyter notebooks with real SPX data in the `Notebooks/` directory.")
-    
-    return rf_model, xgb_model
+    y_demo = np.clip(base_iv + smile_effect + term_effect + noise, 0.05, 1.5)
 
+    scaler = StandardScaler()
+    X_demo_scaled = scaler.fit_transform(X_demo)
 
+    rf_model = RandomForestRegressor(n_estimators=100, max_depth=20, min_samples_split=10, min_samples_leaf=5, random_state=42, n_jobs=-1)
+    xgb_model = xgb.XGBRegressor(n_estimators=100, max_depth=10, learning_rate=0.1, subsample=0.8, colsample_bytree=0.8, random_state=42, n_jobs=-1, verbosity=0)
+
+    with st.spinner("Training demo Random Forest..."):
+        rf_model.fit(X_demo_scaled, y_demo)
+    with st.spinner("Training demo XGBoost..."):
+        xgb_model.fit(X_demo_scaled, y_demo, verbose=False)
+
+    # Save demo models for faster startup later
+    try:
+        joblib.dump(rf_model, RF_PATH)
+        joblib.dump(xgb_model, XGB_PATH)
+        joblib.dump(scaler, SCALER_PATH)
+    except Exception:
+        pass
+
+    st.success("✅ Demo models trained.")
+    return rf_model, xgb_model, scaler
+
+# -------------------
 # Main app
+# -------------------
 def main():
     st.title("📈 European Options Implied Volatility Calculator")
     st.markdown("### Machine Learning-based IV Prediction")
 
-    # Load models
-    rf_model, xgb_model = load_or_train_models()
+    rf_model, xgb_model, scaler = load_or_train_models()
 
     # Sidebar inputs
     st.sidebar.header("Option Parameters")
@@ -189,28 +307,27 @@ def main():
     underlying_price = st.sidebar.number_input(
         "Underlying Price (S)",
         min_value=1.0,
-        max_value=10000.0,
+        max_value=100000.0,
         value=4000.0,
-        step=10.0,
+        step=1.0,
         help="Current price of the underlying asset (e.g., SPX index)"
     )
 
     strike_price = st.sidebar.number_input(
         "Strike Price (K)",
         min_value=1.0,
-        max_value=10000.0,
+        max_value=100000.0,
         value=4100.0,
-        step=10.0,
+        step=1.0,
         help="Strike price of the option"
     )
 
     days_to_expiration = st.sidebar.number_input(
         "Days to Expiration",
         min_value=1,
-        max_value=730,
+        max_value=3650,
         value=30,
-        step=1,
-        help="Number of days until option expiration"
+        step=1
     )
 
     risk_free_rate = st.sidebar.number_input(
@@ -218,247 +335,155 @@ def main():
         min_value=0.0,
         max_value=20.0,
         value=2.0,
-        step=0.1,
-        help="Annual risk-free interest rate"
+        step=0.01
     ) / 100
 
-    option_type = st.sidebar.selectbox(
-        "Option Type",
-        ["Call", "Put"],
-        help="Type of option"
-    )
+    option_type = st.sidebar.selectbox("Option Type", ["Call", "Put"])
 
-    # Calculate derived features
+    # Derived features
     T_years = days_to_expiration / 365.0
     moneyness = underlying_price / strike_price
 
-    # Display calculated features
     st.sidebar.markdown("---")
-    st.sidebar.markdown("**Calculated Features**")
     st.sidebar.metric("Time to Expiration (years)", f"{T_years:.4f}")
     st.sidebar.metric("Moneyness (S/K)", f"{moneyness:.4f}")
     st.sidebar.metric("ITM/OTM", "ITM" if (moneyness > 1 and option_type == "Call") or (moneyness < 1 and option_type == "Put") else "OTM")
 
-    # Prediction button
-    if st.sidebar.button("Calculate IV", type="primary"):
-        # Prepare input
-        X_input = pd.DataFrame({
-            'T_years': [T_years],
-            'moneyness': [moneyness],
-            'risk_free_rate': [risk_free_rate]
+    # Prediction
+    if st.sidebar.button("Calculate IV"):
+        X_input_df = pd.DataFrame({
+            "T_years": [T_years],
+            "moneyness": [moneyness],
+            "risk_free_rate": [risk_free_rate]
         })
 
-        # Create columns for results
+        # scale input
+        X_input_scaled = scaler.transform(X_input_df)
+
         col1, col2, col3 = st.columns(3)
 
-        # Random Forest prediction
+        # Random Forest
         with col1:
             st.markdown("### 🌲 Random Forest")
-            start_time = time.time()
-            rf_iv_raw = rf_model.predict(X_input)[0]
-            rf_iv = np.clip(rf_iv_raw, 0.05, 2.0)  # Ensure valid range
-            rf_time = time.time() - start_time
-
-            # Show warning if value was clipped
+            t0 = time.time()
+            rf_iv_raw = rf_model.predict(X_input_scaled)[0]
+            rf_iv = float(np.clip(rf_iv_raw, 0.0001, 5.0))
+            rf_time = (time.time() - t0) * 1000.0
             if rf_iv_raw != rf_iv:
-                st.warning(f"⚠️ Clipped from {rf_iv_raw*100:.2f}% to valid range")
-
+                st.warning(f"⚠️ Clipped from {rf_iv_raw:.4f} to valid range")
             st.metric("Implied Volatility", f"{rf_iv*100:.2f}%")
-            st.metric("Calculation Time", f"{rf_time*1000:.2f} ms")
-
-            # Calculate option price
-            if option_type == "Call":
-                rf_price = black_scholes_call(underlying_price, strike_price, T_years, risk_free_rate, rf_iv)
-            else:
-                rf_price = black_scholes_put(underlying_price, strike_price, T_years, risk_free_rate, rf_iv)
-
+            st.metric("Calculation Time", f"{rf_time:.1f} ms")
+            rf_price = black_scholes_call(underlying_price, strike_price, T_years, risk_free_rate, rf_iv) if option_type == "Call" else black_scholes_put(underlying_price, strike_price, T_years, risk_free_rate, rf_iv)
             st.metric("Estimated Option Price", f"${rf_price:.2f}")
 
-        # XGBoost prediction
+        # XGBoost
         with col2:
             st.markdown("### 🚀 XGBoost")
-            start_time = time.time()
-            xgb_iv_raw = xgb_model.predict(X_input)[0]
-            xgb_iv = np.clip(xgb_iv_raw, 0.05, 2.0)  # Ensure valid range
-            xgb_time = time.time() - start_time
-
-            # Show warning if value was clipped
+            t0 = time.time()
+            xgb_iv_raw = xgb_model.predict(X_input_scaled)[0]
+            xgb_iv = float(np.clip(xgb_iv_raw, 0.0001, 5.0))
+            xgb_time = (time.time() - t0) * 1000.0
             if xgb_iv_raw != xgb_iv:
-                st.warning(f"⚠️ Clipped from {xgb_iv_raw*100:.2f}% to valid range")
-
+                st.warning(f"⚠️ Clipped from {xgb_iv_raw:.4f} to valid range")
             st.metric("Implied Volatility", f"{xgb_iv*100:.2f}%")
-            st.metric("Calculation Time", f"{xgb_time*1000:.2f} ms")
-
-            if option_type == "Call":
-                xgb_price = black_scholes_call(underlying_price, strike_price, T_years, risk_free_rate, xgb_iv)
-            else:
-                xgb_price = black_scholes_put(underlying_price, strike_price, T_years, risk_free_rate, xgb_iv)
-
+            st.metric("Calculation Time", f"{xgb_time:.1f} ms")
+            xgb_price = black_scholes_call(underlying_price, strike_price, T_years, risk_free_rate, xgb_iv) if option_type == "Call" else black_scholes_put(underlying_price, strike_price, T_years, risk_free_rate, xgb_iv)
             st.metric("Estimated Option Price", f"${xgb_price:.2f}")
 
-        # Black-Scholes comparison (given an assumed IV)
+        # Black-Scholes avg comparison
         with col3:
-            st.markdown("### 📊 Black-Scholes")
-            st.info("Using ML average IV")
-
-            avg_iv = (rf_iv + xgb_iv) / 2
-
-            if option_type == "Call":
-                bs_price = black_scholes_call(underlying_price, strike_price, T_years, risk_free_rate, avg_iv)
-            else:
-                bs_price = black_scholes_put(underlying_price, strike_price, T_years, risk_free_rate, avg_iv)
-
+            st.markdown("### 📊 Black-Scholes (avg ML IV)")
+            avg_iv = (rf_iv + xgb_iv) / 2.0
+            bs_price = black_scholes_call(underlying_price, strike_price, T_years, risk_free_rate, avg_iv) if option_type == "Call" else black_scholes_put(underlying_price, strike_price, T_years, risk_free_rate, avg_iv)
             st.metric("Implied Volatility", f"{avg_iv*100:.2f}%")
             st.metric("Option Price", f"${bs_price:.2f}")
 
-        # Visualization section
+        # Visualizations
         st.markdown("---")
         st.markdown("### 📈 Volatility Surface & Analysis")
-
         tab1, tab2, tab3 = st.tabs(["Volatility Surface", "Price Sensitivity", "Model Comparison"])
 
         with tab1:
-            # Generate IV surface
             strikes = np.linspace(underlying_price * 0.8, underlying_price * 1.2, 20)
             expiries = np.linspace(1/365, 365/365, 20)
-
             strike_mesh, expiry_mesh = np.meshgrid(strikes, expiries)
             moneyness_mesh = underlying_price / strike_mesh
+            # Prepare feature grid and scale once
+            grid_df = pd.DataFrame({
+                "T_years": expiry_mesh.ravel(),
+                "moneyness": moneyness_mesh.ravel(),
+                "risk_free_rate": np.full(expiry_mesh.size, risk_free_rate)
+            })
+            grid_scaled = scaler.transform(grid_df[FEATURE_COLS])
+            preds_grid = rf_model.predict(grid_scaled)
+            iv_surface = np.clip(preds_grid.reshape(expiry_mesh.shape), 0.0001, 5.0) * 100.0
 
-            iv_surface = np.zeros_like(strike_mesh)
-
-            for i in range(len(expiries)):
-                for j in range(len(strikes)):
-                    X_surf = pd.DataFrame({
-                        'T_years': [expiry_mesh[i, j]],
-                        'moneyness': [moneyness_mesh[i, j]],
-                        'risk_free_rate': [risk_free_rate]
-                    })
-                    pred = rf_model.predict(X_surf)[0]
-                    iv_surface[i, j] = np.clip(pred, 0.05, 2.0)
-
-            # Create 3D surface plot
             fig = go.Figure(data=[go.Surface(
                 x=strike_mesh,
                 y=expiry_mesh,
-                z=iv_surface * 100,
+                z=iv_surface,
                 colorscale='Viridis',
                 colorbar=dict(title="IV (%)")
             )])
-
             fig.update_layout(
-                title="Implied Volatility Surface",
-                scene=dict(
-                    xaxis_title="Strike Price",
-                    yaxis_title="Time to Expiration (years)",
-                    zaxis_title="Implied Volatility (%)"
-                ),
+                title="Implied Volatility Surface (Random Forest)",
+                scene=dict(xaxis_title="Strike Price", yaxis_title="Time to Expiration (years)", zaxis_title="Implied Volatility (%)"),
                 height=600
             )
-
-            st.plotly_chart(fig, width="stretch")
+            st.plotly_chart(fig, width='stretch')
 
         with tab2:
-            # Greeks and sensitivity analysis
             st.markdown("#### Option Price Sensitivity")
-
-            # Vary underlying price
             S_range = np.linspace(underlying_price * 0.8, underlying_price * 1.2, 50)
             prices_call = []
             prices_put = []
+            # vectorize predictions
+            sens_df = pd.DataFrame({
+                "T_years": np.full(S_range.size, T_years),
+                "moneyness": S_range / strike_price,
+                "risk_free_rate": np.full(S_range.size, risk_free_rate)
+            })
+            sens_scaled = scaler.transform(sens_df[FEATURE_COLS])
+            iv_preds = np.clip(rf_model.predict(sens_scaled), 0.0001, 5.0)
 
-            for S in S_range:
-                X_sens = pd.DataFrame({
-                    'T_years': [T_years],
-                    'moneyness': [S / strike_price],
-                    'risk_free_rate': [risk_free_rate]
-                })
-                iv_pred = np.clip(rf_model.predict(X_sens)[0], 0.05, 2.0)
-
+            for i, S in enumerate(S_range):
+                iv_pred = iv_preds[i]
                 prices_call.append(black_scholes_call(S, strike_price, T_years, risk_free_rate, iv_pred))
                 prices_put.append(black_scholes_put(S, strike_price, T_years, risk_free_rate, iv_pred))
 
-            # Create plot
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=S_range, y=prices_call, mode='lines', name='Call', line=dict(color='green', width=3)))
-            fig.add_trace(go.Scatter(x=S_range, y=prices_put, mode='lines', name='Put', line=dict(color='red', width=3)))
-            fig.add_vline(x=underlying_price, line_dash="dash", line_color="gray", annotation_text="Current Price")
-            fig.add_vline(x=strike_price, line_dash="dash", line_color="blue", annotation_text="Strike")
-
-            fig.update_layout(
-                title="Option Price vs Underlying Price",
-                xaxis_title="Underlying Price ($)",
-                yaxis_title="Option Price ($)",
-                height=500
-            )
-
-            st.plotly_chart(fig, width="stretch")
+            fig2 = go.Figure()
+            fig2.add_trace(go.Scatter(x=S_range, y=prices_call, mode='lines', name='Call'))
+            fig2.add_trace(go.Scatter(x=S_range, y=prices_put, mode='lines', name='Put'))
+            fig2.add_vline(x=underlying_price, line_dash="dash", annotation_text="Current Price", line_color="gray")
+            fig2.add_vline(x=strike_price, line_dash="dash", annotation_text="Strike", line_color="blue")
+            fig2.update_layout(title="Option Price vs Underlying Price", xaxis_title="Underlying Price ($)", yaxis_title="Option Price ($)", height=500)
+            st.plotly_chart(fig2, width='stretch')
 
         with tab3:
-            # Model comparison
-            st.markdown("#### Model Performance Comparison")
-
-            comparison_data = {
-                'Model': ['Random Forest', 'XGBoost'],
-                'IV Prediction (%)': [rf_iv * 100, xgb_iv * 100],
-                'Calculation Time (ms)': [rf_time * 1000, xgb_time * 1000]
-            }
-
-            comparison_df = pd.DataFrame(comparison_data)
-
+            st.markdown("#### Model Performance Comparison (single input)")
+            comparison_df = pd.DataFrame({
+                "Model": ["Random Forest", "XGBoost"],
+                "IV Prediction (%)": [rf_iv * 100.0, xgb_iv * 100.0],
+                "Calculation Time (ms)": [rf_time, xgb_time]
+            })
             col_a, col_b = st.columns(2)
-
             with col_a:
-                fig = px.bar(comparison_df, x='Model', y='IV Prediction (%)',
-                            title='IV Predictions', color='Model')
-                st.plotly_chart(fig, width="stretch")
-
+                fig = px.bar(comparison_df, x='Model', y='IV Prediction (%)', title='IV Predictions', color='Model')
+                st.plotly_chart(fig, width='stretch')
             with col_b:
-                fig = px.bar(comparison_df, x='Model', y='Calculation Time (ms)',
-                            title='Speed Comparison', color='Model')
-                st.plotly_chart(fig, width="stretch")
+                fig = px.bar(comparison_df, x='Model', y='Calculation Time (ms)', title='Speed Comparison', color='Model')
+                st.plotly_chart(fig, width='stretch')
 
-    # Information section
+    # Info & disclaimers
     st.markdown("---")
     st.markdown("### ℹ️ About This Tool")
-
-    with st.expander("How It Works"):
-        st.markdown("""
-        This application uses machine learning models trained on historical SPX options data to predict implied volatility:
-
-        - **Random Forest**: Ensemble of decision trees, excellent for feature importance analysis
-        - **XGBoost**: Gradient boosting algorithm, optimized for speed and accuracy
-        - **Neural Networks**: Deep learning approach for capturing complex patterns (available in notebooks)
-
-        The models are trained on features including:
-        - Time to expiration (years)
-        - Moneyness (S/K ratio)
-        - Risk-free rate
-        """)
-
-    with st.expander("Model Training"):
-        st.markdown("""
-        Models are trained on SPX European options data with the following characteristics:
-
-        - **Dataset**: ~2.8M option contracts from 2022
-        - **Train/Val/Test Split**: 70/15/15 (random split)
-        - **Performance**: R² ≈ 0.8 on test set
-        - **Speed**: 100-1000x faster than numerical Black-Scholes solver
-
-        See the Jupyter notebooks in the `Notebooks/` directory for full training details.
-        """)
-
+    st.info("Models are trained using CSVs in `data/model_input/`. Expected columns include: STRIKE, moneyness, T_years, iv, risk_free_rate. The app will derive underlying_price = moneyness * STRIKE.")
     with st.expander("Limitations & Disclaimers"):
         st.markdown("""
-        ⚠️ **Important Disclaimers**:
-
-        - This tool is for educational and research purposes only
-        - Not financial advice - do not use for actual trading decisions
-        - Model predictions are based on historical data and may not reflect current market conditions
-        - Always consult with a qualified financial advisor before making investment decisions
-        - The models may not account for all market factors (volatility smile, term structure, etc.)
+        ⚠️ For educational/research use only. Not financial advice.
+        - Models trained on historical data and may not reflect current market conditions.
+        - Consider a train/validation split and hyperparameter tuning for production.
         """)
-
 
 if __name__ == "__main__":
     main()
