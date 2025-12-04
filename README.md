@@ -26,29 +26,35 @@ The goal is to assess whether machine learning methods can match or outperform t
 - **Environment:** Jupyter Notebook / VS Code  
 
 ## Folder Structure
+```
 FEC-European-options-7/
 ├── datasets/
-│ └── spx_eod_*/ # Raw quarterly data files (not in repo)
+│   └── spx_eod_*/           # Raw quarterly data files (not in repo)
+
+
+
+│
 ├── Notebooks/
-│ ├── data_collection.ipynb
-│ ├── data_processing.ipynb
-│ ├── model_training.ipynb
-│ ├── test_random_split.ipynb
-│ ├── stretch_goal_1_blackscholes.ipynb
-│ └── stretch_goal_2_training_size.ipynb
+│   ├── data_collection.ipynb
+│   ├── data_processing.ipynb
+│   ├── model_training.ipynb
+│   ├── test_random_split.ipynb
+│   ├── stretch_goal_1_blackscholes.ipynb   # NEW: Black-Scholes comparison
+│   └── stretch_goal_2_training_size.ipynb  # NEW: Training set analysis
+│
 ├── data/
-│ ├── processed_by_file/ # Cleaned CSVs
-│ └── model_input/ # Train/val/test splits
-│ ├── X_train.csv
-│ ├── y_train.csv
-│ ├── X_val.csv
-│ ├── y_val.csv
-│ ├── X_test.csv
-│ └── y_test.csv
-├── models/ # Saved model files (optional)
-├── app.py # Streamlit web application
-├── requirements.txt # Python dependencies
+│   ├── processed_by_file/   # Cleaned CSVs
+│   └── model_input/         # Train/val/test splits
+│       ├── X_train.csv, y_train.csv
+│       ├── X_val.csv, y_val.csv
+│       └── X_test.csv, y_test.csv
+│
+├── models/                  # Saved model files (optional)
+│
+├── app.py                   # NEW: Streamlit web application
+├── requirements.txt         # NEW: Python dependencies
 └── README.md
+```
 
 ## Key Steps
 
