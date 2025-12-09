@@ -1,4 +1,10 @@
-# Machine Learning for European Option Pricing (Team Name: FEC-European-options-7)
+# Machine Learning for European Option Pricing
+
+**Team:** Ayaan Chawla, Warren Hsu, Aakash Kolli, Jason Yap  
+Fall 2025 Financial Engineering Club, UIUC ML Project Team 7
+
+**View our Fall 2025 project poster:**
+[Machine Learning for Implied Volatility Prediction: A Comparison with Black-Scholes (PDF)](https://drive.google.com/file/d/1T7A0guWw8pAAKwo7U_u1wr1clM6DhbtH/view)
 
 ## Overview
 This project explores the use of **machine learning models** to price **European-style options** and estimate **implied volatility** using open-source data from [OptionsDX.com](https://optionsdx.com/).  
